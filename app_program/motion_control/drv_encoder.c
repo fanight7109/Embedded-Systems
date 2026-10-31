@@ -20,7 +20,9 @@
 #define LEFT_SHIFT      (16u)
 #define HALF_MASK       (0xFFFFu)
 #define UM_PER_MM       (1000)
-#define UM_PER_EDGE     ((int32_t)(APP_WHEEL_CIRC_UM / APP_ENC_EDGES_PER_REV))
+#define UM_PER_EDGE_L   ((int32_t)(APP_WHEEL_CIRC_UM / APP_ENC_EDGES_PER_REV_L))
+#define UM_PER_EDGE_R   ((int32_t)(APP_WHEEL_CIRC_UM / APP_ENC_EDGES_PER_REV_R))
+#define UM_PER_EDGE     ((UM_PER_EDGE_L + UM_PER_EDGE_R) / 2)
 
 /* Written only by drv_encoder_edge_isr(); see encoder.h. */
 static volatile uint32_t g_enc_counts = 0u;
@@ -98,10 +100,32 @@ drv_encoder_delta (uint16_t now, uint16_t before)
     return (int16_t)diff;
 }
 
+/*!
+ * @brief Edges to mm with the mean of both wheels' scales (tests and
+ *        whole-car estimates). Per-wheel travel: the two functions below.
+ */
 int32_t
 drv_encoder_edges_to_mm (int32_t edges)
 {
     return (edges * UM_PER_EDGE) / UM_PER_MM;
+}
+
+/*!
+ * @brief Left wheel edges to mm (APP_ENC_EDGES_PER_REV_L).
+ */
+int32_t
+drv_encoder_left_to_mm (int32_t edges)
+{
+    return (edges * UM_PER_EDGE_L) / UM_PER_MM;
+}
+
+/*!
+ * @brief Right wheel edges to mm (APP_ENC_EDGES_PER_REV_R).
+ */
+int32_t
+drv_encoder_right_to_mm (int32_t edges)
+{
+    return (edges * UM_PER_EDGE_R) / UM_PER_MM;
 }
 
 int32_t

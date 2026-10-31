@@ -23,6 +23,7 @@
 #include "../integration/fault.h"
 #include "../integration/rtos_obj.h"
 #include "../integration/probe.h"
+#include "../evidence/evidence.h"
 #include "drv_encoder.h"
 #include "drv_motor.h"
 #include "pid.h"
@@ -69,7 +70,7 @@ typedef struct
     uint16_t       last_r;
     uint16_t       start_l;
     uint16_t       start_r;
-    uint16_t       target_edges;
+    uint16_t       target_mm;      /* Manoeuvre length (mean wheel).  */
     uint16_t       elapsed;
     uint16_t       limit;
     uint16_t       cmd_speed;
@@ -105,7 +106,7 @@ static void    plan_manoeuvre(motion_ctx_t * p_ctx);
 static void    plan_stopping(motion_ctx_t * p_ctx);
 static void    drive_wheels(motion_ctx_t * p_ctx);
 static int16_t wheel_duty(pid_state_t * p_pid, int16_t set, int16_t meas,
-                          uint32_t word_a);
+                          uint32_t word_a, int32_t ff_x10);
 static void    check_stall(motion_ctx_t * p_ctx, int16_t duty_l,
                            int16_t duty_r);
 static uint8_t stall_step(uint8_t count, bool b_stalled);
@@ -151,6 +152,7 @@ motion_task (INT stacd, void * p_exinf)
     {
         uint32_t release = 0u;
         uint32_t start   = 0u;
+        uint32_t end     = 0u;
 
         (void)tk_slp_tsk(TMO_FEVR);
         probe_high();
@@ -158,9 +160,9 @@ motion_task (INT stacd, void * p_exinf)
         release = rtos_obj_release_us(RTOS_REL_MOTION);
 
         run_cycle(&g_motion);
+        end = board_time_us();
 
-        if (rtos_obj_missed_deadline(release, start, board_time_us(),
-                                     PERIOD_US))
+        if (rtos_obj_missed_deadline(release, start, end, PERIOD_US))
         {
             g_motion.flags.miss_cnt++;
 
@@ -174,6 +176,7 @@ motion_task (INT stacd, void * p_exinf)
             g_motion.flags.miss_cnt = 0u;
         }
 
+        evidence_cycle(EV_LOOP_T2, release, start, end);    /* INT-09 */
         probe_low();
     }
 }
@@ -197,6 +200,11 @@ run_cycle (motion_ctx_t * p_ctx)
         (MOTION_ST_SAFE_STOP == p_ctx->flags.state))
     {
         enter_safe_stop(p_ctx, sys);
+
+        /* Measurement only (motors stay off): keeps the telemetry encoder
+         * counts, speeds and odometer live in SAFE STOP for bench checks
+         * such as turning a wheel by hand (A2). */
+        read_encoders(p_ctx);
     }
     else
     {
@@ -256,6 +264,7 @@ enter_safe_stop (motion_ctx_t * p_ctx, UINT sys_flags)
 
     if (MOTION_ST_SAFE_STOP != p_ctx->flags.state)
     {
+        evidence_pwm_zero(EV_PWM_SAFE);                     /* INT-10 */
         p_ctx->flags.state = MOTION_ST_SAFE_STOP;
         p_ctx->set_l = 0;
         p_ctx->set_r = 0;
@@ -284,8 +293,8 @@ read_encoders (motion_ctx_t * p_ctx)
     int32_t        span_r = drv_encoder_delta(now_r, p_ctx->hist_r[oldest]);
 
     /* Edges -> um over the window -> um/ms, which is mm/s. */
-    span_l = drv_encoder_edges_to_mm(span_l * 1000) / win_ms;
-    span_r = drv_encoder_edges_to_mm(span_r * 1000) / win_ms;
+    span_l = drv_encoder_left_to_mm(span_l * 1000) / win_ms;
+    span_r = drv_encoder_right_to_mm(span_r * 1000) / win_ms;
     p_ctx->meas_l = (int16_t)span_l;
     p_ctx->meas_r = (int16_t)span_r;
 
@@ -293,9 +302,9 @@ read_encoders (motion_ctx_t * p_ctx)
     p_ctx->hist_r[oldest] = now_r;
     p_ctx->hist_idx = (uint8_t)((oldest + 1u) % APP_SPEED_WIN);
 
-    p_ctx->odo_um += (uint32_t)drv_encoder_edges_to_mm(
-                         ((int32_t)abs16(d_left) + (int32_t)abs16(d_right)) *
-                         500);
+    p_ctx->odo_um += (uint32_t)(
+        drv_encoder_left_to_mm((int32_t)abs16(d_left) * 500) +
+        drv_encoder_right_to_mm((int32_t)abs16(d_right) * 500));
     g_odometer_mm = (uint16_t)(p_ctx->odo_um / 1000u);
 
     p_ctx->b_still_l = (0 == d_left);
@@ -330,12 +339,22 @@ accept_command (motion_ctx_t * p_ctx, uint32_t cmd)
             p_ctx->flags.stale = 0u;
         break;
 
+        case MSG_MC_EDGE_ALIGN:
+            /* Line following with zero cruise: the steering alone pivots
+             * the car until the left sensor sits on the edge. */
+            p_ctx->cmd_speed   = 0u;
+            p_ctx->flags.mode  = MOTION_MODE_LINE;
+            p_ctx->flags.state = MOTION_ST_EXECUTE;
+            p_ctx->flags.stale = 0u;
+        break;
+
         case MSG_MC_MOVE_DIST:
         case MSG_MC_REVERSE:
             b_ok = (0u != param);
 
             if (b_ok)
             {
+                evidence_manoeuvre(EV_MAN_START, type, 0u, param);
                 start_manoeuvre(p_ctx, (MSG_MC_REVERSE == type) ?
                                 MOTION_MODE_REVERSE : MOTION_MODE_MOVE,
                                 param);
@@ -352,6 +371,8 @@ accept_command (motion_ctx_t * p_ctx, uint32_t cmd)
                                         (360u * 10000u);
 
                 p_ctx->flags.turn_right = msg_mc_dir(cmd) & 0x1u;
+                evidence_manoeuvre(EV_MAN_START, type,
+                                   (uint8_t)(msg_mc_dir(cmd) & 0x1u), param);
                 start_manoeuvre(p_ctx, MOTION_MODE_TURN, arc_mm);
             }
         break;
@@ -381,8 +402,7 @@ start_manoeuvre (motion_ctx_t * p_ctx, uint8_t mode, uint32_t distance_mm)
 
     p_ctx->flags.mode   = mode & 0x3u;
     p_ctx->flags.state  = MOTION_ST_EXECUTE;
-    p_ctx->target_edges =
-        (uint16_t)drv_encoder_mm_to_edges((int32_t)distance_mm);
+    p_ctx->target_mm    = (uint16_t)distance_mm;
     p_ctx->start_l      = p_ctx->last_l;
     p_ctx->start_r      = p_ctx->last_r;
     p_ctx->elapsed      = 0u;
@@ -401,6 +421,8 @@ begin_stop (motion_ctx_t * p_ctx)
     else
     {
         p_ctx->flags.state = MOTION_ST_IDLE;
+        evidence_pwm_zero(EV_PWM_ROUTINE);          /* Already at zero. */
+        evidence_wheels_still();
         send_event(MSG_EV_STOPPED, p_ctx->flags.seq);
     }
 }
@@ -454,6 +476,16 @@ plan_line_follow (motion_ctx_t * p_ctx)
                   (p_ctx->line_err - p_ctx->prev_err))) / 10;
     }
 
+    /* EDGE_ALIGN (zero cruise): pivot slowly. The left sensor swings from
+     * white to black within a few mm, so a full-strength pivot overshoots
+     * the edge and hunts (bench 26 Oct). */
+    if (0u == p_ctx->cmd_speed)
+    {
+        steer = (steer > APP_EDGE_ALIGN_SPEED) ? APP_EDGE_ALIGN_SPEED :
+                ((steer < -APP_EDGE_ALIGN_SPEED) ? -APP_EDGE_ALIGN_SPEED :
+                 steer);
+    }
+
     p_ctx->set_l = (int16_t)(p_ctx->cruise + steer);
     p_ctx->set_r = (int16_t)(p_ctx->cruise - steer);
 }
@@ -467,8 +499,10 @@ plan_manoeuvre (motion_ctx_t * p_ctx)
 {
     int32_t const prog_l   = drv_encoder_delta(p_ctx->last_l, p_ctx->start_l);
     int32_t const prog_r   = drv_encoder_delta(p_ctx->last_r, p_ctx->start_r);
-    int32_t const done = (abs16((int16_t)prog_l) + abs16((int16_t)prog_r)) / 2;
-    int32_t const left = (int32_t)p_ctx->target_edges - done;
+    int32_t const mm_l = drv_encoder_left_to_mm(abs16((int16_t)prog_l));
+    int32_t const mm_r = drv_encoder_right_to_mm(abs16((int16_t)prog_r));
+    int32_t const done = (mm_l + mm_r) / 2;      /* Mean wheel travel, mm. */
+    int32_t const left = (int32_t)p_ctx->target_mm - done;
     int32_t       vel  = 0;
 
     p_ctx->elapsed++;
@@ -485,10 +519,11 @@ plan_manoeuvre (motion_ctx_t * p_ctx)
         p_ctx->set_r = 0;
         p_ctx->cruise = 0;
         send_event(MSG_EV_MOVE_DONE, p_ctx->flags.seq);
+        evidence_manoeuvre(EV_MAN_DONE, 0u, 0u, p_ctx->elapsed);  /* INT-11 */
     }
     else
     {
-        vel = APP_MIN_MOVE_SPEED + (drv_encoder_edges_to_mm(left) * DECEL_GAIN);
+        vel = APP_MIN_MOVE_SPEED + (left * DECEL_GAIN);
         vel = (vel > (int32_t)p_ctx->cmd_speed) ? (int32_t)p_ctx->cmd_speed
                                                 : vel;
         p_ctx->cruise = approach(p_ctx->cruise, (int16_t)vel,
@@ -505,9 +540,9 @@ plan_manoeuvre (motion_ctx_t * p_ctx)
         {
             int16_t const sign = (MOTION_MODE_REVERSE == p_ctx->flags.mode)
                                  ? -1 : 1;
-            int32_t const skew = drv_encoder_edges_to_mm(
-                abs16((int16_t)prog_l) - abs16((int16_t)prog_r));
-            int32_t const corr = (APP_STRAIGHT_K_X10 * skew) / 10;
+            int32_t const skew = mm_l - mm_r;
+            /* Cast: the gain is unsigned; a negative skew must stay signed. */
+            int32_t const corr = ((int32_t)APP_STRAIGHT_K_X10 * skew) / 10;
 
             p_ctx->set_l = (int16_t)(sign * (p_ctx->cruise - corr));
             p_ctx->set_r = (int16_t)(sign * (p_ctx->cruise + corr));
@@ -528,11 +563,17 @@ plan_stopping (motion_ctx_t * p_ctx)
     p_ctx->set_r  = approach(p_ctx->set_r, 0, step);
     p_ctx->cruise = 0;
 
+    if ((0 == p_ctx->set_l) && (0 == p_ctx->set_r))
+    {
+        evidence_pwm_zero(EV_PWM_ROUTINE);  /* INT-10: zero duty from now. */
+    }
+
     if ((0 == p_ctx->set_l) && (0 == p_ctx->set_r) &&
         (abs16(p_ctx->meas_l) < STOPPED_MMS) &&
         (abs16(p_ctx->meas_r) < STOPPED_MMS))
     {
         p_ctx->flags.state = MOTION_ST_IDLE;
+        evidence_wheels_still();
         send_event(MSG_EV_STOPPED, p_ctx->flags.seq);
     }
 }
@@ -545,9 +586,11 @@ drive_wheels (motion_ctx_t * p_ctx)
 {
     uint32_t const word_a = config_word_a();
     int16_t const  duty_l = wheel_duty(&p_ctx->pid_l, p_ctx->set_l,
-                                       p_ctx->meas_l, word_a);
+                                       p_ctx->meas_l, word_a,
+                                       (int32_t)APP_FF_L_X10);
     int16_t const  duty_r = wheel_duty(&p_ctx->pid_r, p_ctx->set_r,
-                                       p_ctx->meas_r, word_a);
+                                       p_ctx->meas_r, word_a,
+                                       (int32_t)APP_FF_R_X10);
 
     check_stall(p_ctx, duty_l, duty_r);
     drv_encoder_set_direction_hint(duty_l >= 0, duty_r >= 0);
@@ -556,10 +599,11 @@ drive_wheels (motion_ctx_t * p_ctx)
 }
 
 /*!
- * @brief Feed-forward plus PID for one wheel; signed duty out.
+ * @brief Feed-forward (that wheel's ff_x10) plus PID; signed duty out.
  */
 static int16_t
-wheel_duty (pid_state_t * p_pid, int16_t set, int16_t meas, uint32_t word_a)
+wheel_duty (pid_state_t * p_pid, int16_t set, int16_t meas, uint32_t word_a,
+            int32_t ff_x10)
 {
     int32_t duty = 0;
 
@@ -569,7 +613,7 @@ wheel_duty (pid_state_t * p_pid, int16_t set, int16_t meas, uint32_t word_a)
     }
     else
     {
-        duty = (((int32_t)set * (int32_t)APP_FF_DUTY_PER_MMS_X10) / 10) +
+        duty = (((int32_t)set * ff_x10) / 10) +
                pid_step(p_pid,
                         config_gain_x100(word_a, CONFIG_KP_SHIFT),
                         config_gain_x100(word_a, CONFIG_KI_SHIFT),

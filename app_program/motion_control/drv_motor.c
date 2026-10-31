@@ -3,8 +3,10 @@
  * @brief PWM motor driver for the Robo Pico H-bridge (template BSP PWM).
  *
  * Forward drives PWM on pin A with pin B low; reverse drives PWM on pin B
- * with pin A low; both low coasts. Duty is in 0.1 % units (0 .. 1000) and
- * is scaled to the PWM compare value only at the register write (rule R6).
+ * with pin A low; both low coasts. APP_MOTOR_L_INVERT / APP_MOTOR_R_INVERT
+ * swap that per motor (the left motor is forward on M1B). Duty is in
+ * 0.1 % units (0 .. 1000) and is scaled to the PWM compare value only at
+ * the register write (rule R6).
  * Slices 4 and 5 run at 20 kHz from the 125 MHz system clock, divider 1.
  *
  * Owner: Buddy 2 (PEH JUN WEI JOEL).
@@ -54,8 +56,12 @@ void
 drv_motor_drive (uint16_t duty_left, bool b_left_fwd, uint16_t duty_right,
                  bool b_right_fwd)
 {
-    drive_one(APP_PIN_M1A, APP_PIN_M1B, duty_left, b_left_fwd);
-    drive_one(APP_PIN_M2A, APP_PIN_M2B, duty_right, b_right_fwd);
+    bool const b_l_inv = (0 != APP_MOTOR_L_INVERT);
+    bool const b_r_inv = (0 != APP_MOTOR_R_INVERT);
+
+    drive_one(APP_PIN_M1A, APP_PIN_M1B, duty_left, (b_left_fwd != b_l_inv));
+    drive_one(APP_PIN_M2A, APP_PIN_M2B, duty_right,
+              (b_right_fwd != b_r_inv));
 }
 
 /*!

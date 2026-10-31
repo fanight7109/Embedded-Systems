@@ -23,6 +23,8 @@ uint16_t drv_encoder_right(uint32_t snapshot);
 int16_t  drv_encoder_delta(uint16_t now, uint16_t before);
 int32_t  drv_encoder_edges_to_mm(int32_t edges);
 int32_t  drv_encoder_mm_to_edges(int32_t distance_mm);
+int32_t  drv_encoder_left_to_mm(int32_t edges);
+int32_t  drv_encoder_right_to_mm(int32_t edges);
 void     drv_encoder_set_direction_hint(bool b_left_fwd, bool b_right_fwd);
 
 /* Called only from gpio_dispatch_isr(). */
