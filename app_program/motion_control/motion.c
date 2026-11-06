@@ -460,6 +460,7 @@ static void
 plan_line_follow (motion_ctx_t * p_ctx)
 {
     int32_t steer = 0;
+    int32_t speed = 0;
 
     if (p_ctx->flags.stale >= STALE_LIMIT)
     {
@@ -468,12 +469,27 @@ plan_line_follow (motion_ctx_t * p_ctx)
 
     p_ctx->cruise = approach(p_ctx->cruise, (int16_t)p_ctx->cmd_speed,
                              ACCEL_STEP_MMS);
+    speed = p_ctx->cruise;
 
     if (0u != p_ctx->flags.line_valid)
     {
+        int32_t const abs_err = (p_ctx->line_err < 0) ?
+                                -(int32_t)p_ctx->line_err :
+                                (int32_t)p_ctx->line_err;
+
         steer = (((int32_t)APP_LINE_KP_X10 * p_ctx->line_err) +
                  ((int32_t)APP_LINE_KD_X10 *
                   (p_ctx->line_err - p_ctx->prev_err))) / 10;
+
+        /* Slow down in bends: same steer, tighter turn. */
+        if (speed > APP_LINE_TURN_SPEED)
+        {
+            int32_t const span = speed - APP_LINE_TURN_SPEED;
+            int32_t const cut  = (abs_err >= APP_LINE_ERR_FULL) ? span :
+                                 ((span * abs_err) / APP_LINE_ERR_FULL);
+
+            speed -= cut;
+        }
     }
 
     /* EDGE_ALIGN (zero cruise): pivot slowly. The left sensor swings from
@@ -486,8 +502,8 @@ plan_line_follow (motion_ctx_t * p_ctx)
                  steer);
     }
 
-    p_ctx->set_l = (int16_t)(p_ctx->cruise + steer);
-    p_ctx->set_r = (int16_t)(p_ctx->cruise - steer);
+    p_ctx->set_l = (int16_t)(speed + steer);
+    p_ctx->set_r = (int16_t)(speed - steer);
 }
 
 /*!
