@@ -1,142 +1,228 @@
-/*
- *	app_main.c
- *	START HERE.  usermain() below is your program's entry point.
+/** @file app_main.c
  *
- *	How micro T-Kernel starts your code
- *	-----------------------------------
- *	  reset -> kernel initialises itself -> creates the "initial task"
- *	        -> initial task calls usermain()
+ * @brief IS05 start-up: board, kernel objects, drivers, tasks, cyclic
+ *        handlers, then (TEST=1) the on-target tests.
  *
- *	usermain() runs inside that initial task at priority 1 (the highest).
- *	On a single core nothing you create runs until usermain() blocks, but
- *	on the dual-core build the OTHER core may start a new task at once.
- *	So usermain() works in two phases:
- *	  1. every subsystem creates its kernel objects  (subsystemN_init)
- *	  2. every subsystem starts its tasks             (subsystemN_start)
- *	and then puts the initial task to sleep forever.
- *	If usermain() RETURNS, the kernel shuts the whole system down.
+ * usermain() runs in the kernel's initial task at priority 1. In this
+ * single-core build nothing it creates runs until it blocks, so phase 1
+ * (objects and drivers) is always complete before any task starts.
  *
- *	The example system: one subsystem per folder, one task each
- *	------------------------------------------------------------
- *	  subsystem1/  LED       blinks GP19, paced by a cyclic handler
- *	  subsystem2/  Producer  makes a "sample" every 300 ms     (core 1)
- *	  subsystem3/  Consumer  collects samples into statistics  (core 0)
- *	  subsystem4/  Monitor   prints reports, pauses/resumes the LED
- *	  subsystem5/  (empty template for the fifth student)
+ *   1. board_init(): fixes the timer tick (PF-001) before any timing.
+ *   2. config defaults and every kernel object (rtos_obj_create).
+ *   3. the shared GPIO interrupt, before any module enables a pin IRQ.
+ *   4. ssN_init(): each subsystem sets up the peripherals it owns.
+ *   5. ssN_start() and T6, then the cyclic handlers that release
+ *      T2, T3 and T4 (they need those task IDs).
  *
- *	How they talk to each other (the interfaces, see TEAM.md section 5):
- *	  IF-01  S2 -> S3  mailbox mbx_samples      (owned by S3)
- *	  IF-02  S3 -> S2  semaphore sem_slots + memory pool mpf_samples
- *	                   (owned by S2: S3 hands slots and blocks back)
- *	  IF-03  S3 -> S4  message buffer mbf_summary + event flag flg_events
- *	                   (owned by S4)
- *	  IF-04  S4 -> S3  reads app_stats under mutex mtx_stats (owned by S3)
- *	  IF-05  S4 -> S1  suspends/resumes the LED task tid_led (owned by S1)
- *	The subsystem that RECEIVES or OWNS the data creates the object and
- *	publishes its ID in its header; the other side just uses it.
+ * EVIDENCE=1 builds also start the evidence task (test plan INT-09 ..
+ * INT-15), and run the INT-14 PWM/servo bench instead of step 5 when GP21
+ * is held down at power-up.
  *
- *	micro T-Kernel APIs used, and where to find them:
- *	  tasks       tk_cre_tsk tk_sta_tsk tk_slp_tsk tk_wup_tsk tk_can_wup
- *	              tk_dly_tsk tk_sus_tsk tk_rsm_tsk tk_chg_pri tk_ref_tsk
- *	              tk_get_tid tk_get_prc                         app_main.c, S1-S4
- *	  semaphore   tk_cre_sem tk_wai_sem tk_sig_sem tk_ref_sem       S2, S3, S4
- *	  mem. pool   tk_cre_mpf tk_get_mpf tk_rel_mpf tk_ref_mpf       S2, S3, S4
- *	  mailbox     tk_cre_mbx tk_snd_mbx tk_rcv_mbx                  S2, S3
- *	  mutex       tk_cre_mtx tk_loc_mtx tk_unl_mtx                  S3, S4
- *	  msg buffer  tk_cre_mbf tk_snd_mbf tk_rcv_mbf                  S3, S4
- *	  event flag  tk_cre_flg tk_set_flg tk_wai_flg                  S3, S4
- *	  cyclic      tk_cre_cyc tk_ref_cyc                             S1
- *	  alarm       tk_cre_alm tk_sta_alm tk_stp_alm                  S4
- *	  time        tk_get_tim                                        S2, S4
- *	  system      tk_ref_ver                                        app_main.c
- *
- *	Output appears on the USB serial port (115200 8N1 in any terminal).
+ * Owner: Integration.
  */
 
-#include "app.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include <tk/tkernel.h>
+#include <tm/tmonitor.h>
+#include "integration/app_cfg.h"
+#include "integration/board.h"
+#include "integration/config.h"
+#include "integration/rtos_obj.h"
+#include "integration/probe.h"
+#include "integration/gpio_isr.h"
+#include "integration/button.h"
+#include "integration/nav.h"
+#include "communications/ss1_comms.h"
+#include "motion_control/ss2_motion.h"
+#include "line_barcode/ss3_line.h"
+#include "terrain/ss4_imu.h"
+#include "obstacles/ss5_obstacle.h"
+#include "evidence/evidence.h"
+#include "evidence/ev_bench.h"
+#include "app_main.h"
 
 /*
- * Create and start one task (declared in app.h for every subsystem).
- *   prc = TP_PRC1 (core 0), TP_PRC2 (core 1), or 0 for "any core".
+ * The design (Design Review 2.3) assumes one core: the ISR-to-task hand-offs
+ * and single-writer globals are not safe with two cores running tasks.
  */
-EXPORT ID app_start_task(FP entry, PRI pri, UW prc, const char *name)
-{
-	T_CTSK	ctsk = {0};
-	ID	tid;
-	ER	er;
-
-	ctsk.task    = entry;		/* function the task runs */
-	ctsk.itskpri = pri;		/* initial priority (1 = highest) */
-	ctsk.stksz   = TASK_STACK_SIZE;	/* kernel allocates the stack */
-	ctsk.tskatr  = TA_HLNG		/* written in a high-level language (C) */
-		     | TA_RNG3;		/* runs at user protection level */
-#if TK_SUPPORT_SMP
-	if (prc != 0) {
-		ctsk.tskatr |= TA_ASSPRC;	/* honour the affinity below */
-		ctsk.assprc  = prc;		/* which core(s) it may run on */
-	}
-#else
-	(void)prc;			/* single-core build: no affinity */
+#if (1 == TK_SUPPORT_SMP)
+#error "IS05 firmware must be built single-core: make SMP=0"
 #endif
 
-	/* tk_cre_tsk: create the task.  It starts in the DORMANT state. */
-	tid = tk_cre_tsk(&ctsk);
-	if (tid < E_OK) {
-		CHECK(tid, name);
-		return tid;
-	}
+static ER   start_all(void);
+static void report(char const * p_what, ER err);
 
-	/* tk_sta_tsk: DORMANT -> READY.  The int is passed as stacd. */
-	er = tk_sta_tsk(tid, 0);
-	CHECK(er, name);
-	return tid;
+/*!
+ * @brief Kernel entry point. Never returns (returning shuts down).
+ */
+EXPORT INT
+usermain (void)
+{
+    ER err = E_OK;
+
+    board_init();
+    (void)tm_printf((UB *)"\n=== IS05 robot car, micro T-Kernel 3.0 ===\n");
+
+    probe_init();
+    config_init_defaults();
+    evidence_init();
+    err = rtos_obj_create();
+    report("rtos_obj_create", err);
+
+    if (E_OK == err)
+    {
+        err = gpio_isr_init();
+        report("gpio_isr_init", err);
+    }
+
+    if (E_OK == err)
+    {
+        /* Phase 1: drivers, each by its owning subsystem. */
+        report("ss1_comms_init", ss1_comms_init());
+        report("ss2_motion_init", ss2_motion_init());
+        report("ss3_line_init", ss3_line_init());
+        report("ss4_imu_init", ss4_imu_init());
+        report("ss5_obstacle_init", ss5_obstacle_init());
+        nav_init();
+        button_init();
+
+        if (ev_bench_requested())
+        {
+            /* INT-14: usermain is still the only writer of every PWM. */
+            ev_bench_run();
+
+            for (;;)
+            {
+                (void)tk_slp_tsk(TMO_FEVR);
+            }
+        }
+
+        /* Phase 2: tasks and cyclic releases. */
+        err = start_all();
+    }
+
+    if (E_OK != err)
+    {
+        /* WARNING: no safe operation possible; motors stay off. */
+        rtos_obj_sys_set(RTOS_SYS_FAULT);
+        (void)tm_printf((UB *)"start-up failed, system held in FAULT\n");
+    }
+    else
+    {
+        (void)tm_printf((UB *)"all subsystems started\n");
+    }
+
+#if (1 == APP_TEST)
+    (void)tm_printf((UB *)"[TEST] === test run start ===\n");
+    ss1_comms_test();
+    ss2_motion_test();
+    ss3_line_test();
+    ss4_imu_test();
+    ss5_obstacle_test();
+    (void)tm_printf((UB *)"[TEST] === test run end ===\n");
+#endif
+
+    for (;;)
+    {
+        (void)tk_slp_tsk(TMO_FEVR);
+    }
+
+    return 0;
 }
 
-EXPORT INT usermain(void)
+/*!
+ * @brief Create and start a task (TA_HLNG, kernel-allocated stack).
+ *
+ * @return Task ID (> 0) or a negative kernel error code.
+ */
+ID
+app_main_start_task (app_main_task_fn_t p_fn, PRI priority, SZ stack_bytes)
 {
-	T_RVER	ver;
+    T_CTSK ctsk  = { 0 };
+    ID     tskid = 0;
 
-	/* tk_ref_ver: ask the kernel who it is */
-	tk_ref_ver(&ver);
-	tm_printf((UB*)"\n=== micro T-Kernel on Raspberry Pi Pico W"
-		  " (spec 0x%04x, product 0x%04x) ===\n", ver.spver, ver.prver);
-#if TK_SUPPORT_SMP
-	tm_printf((UB*)"dual-core (SMP) build, usermain on core %d\n",
-		  tk_get_prc() - 1);	/* tk_get_prc() counts from 1 */
-#else
-	tm_printf((UB*)"single-core build\n");
-#endif
+    /* Cast: the kernel stores task entry points as the generic FP type. */
+    ctsk.task    = (FP)p_fn;
+    ctsk.itskpri = priority;
+    ctsk.stksz   = stack_bytes;
+    ctsk.tskatr  = TA_HLNG | TA_RNG0;
+    tskid        = tk_cre_tsk(&ctsk);
 
-	/* Phase 1: every subsystem creates its kernel objects */
-	CHECK(subsystem1_init(), "subsystem1_init");
-	CHECK(subsystem2_init(), "subsystem2_init");
-	CHECK(subsystem3_init(), "subsystem3_init");
-	CHECK(subsystem4_init(), "subsystem4_init");
-	CHECK(subsystem5_init(), "subsystem5_init");
+    if (tskid > 0)
+    {
+        ER const err = tk_sta_tsk(tskid, 0);
 
-	/* Phase 2: every subsystem starts its tasks */
-	CHECK(subsystem1_start(), "subsystem1_start");
-	CHECK(subsystem2_start(), "subsystem2_start");
-	CHECK(subsystem3_start(), "subsystem3_start");
-	CHECK(subsystem4_start(), "subsystem4_start");
-	CHECK(subsystem5_start(), "subsystem5_start");
+        if (E_OK != err)
+        {
+            tskid = (ID)err;
+        }
+    }
 
-	tm_printf((UB*)"all subsystems started\n\n");
-
-#if APP_TEST
-	/* Test build (make TEST=1): run every subsystem's tests in turn,
-	   here in the initial task, while the system is running.  Tests may
-	   call tk_dly_tsk() to let the other tasks work for a while. */
-	tm_printf((UB*)"[TEST] === test run start ===\n");
-	subsystem1_test();
-	subsystem2_test();
-	subsystem3_test();
-	subsystem4_test();
-	subsystem5_test();
-	tm_printf((UB*)"[TEST] === test run end ===\n");
-#endif
-
-	/* Sleep forever.  Returning from usermain() would shut down. */
-	tk_slp_tsk(TMO_FEVR);
-	return 0;
+    return tskid;
 }
+
+/*!
+ * @brief Start T2..T6 and T1, then the cyclic handlers.
+ */
+static ER
+start_all (void)
+{
+    ER       err       = E_OK;
+    ID const motion_id = ss2_motion_start();
+    ID const line_id   = ss3_line_start();
+    ID const nav_id    = app_main_start_task(nav_task, APP_PRI_NAV,
+                                             APP_STK_NAV);
+    ID const obs_id    = ss5_obstacle_start();
+    ID const imu_id    = ss4_imu_start();
+    ID const tlm_id    = ss1_comms_start();
+    ID const ev_id     = evidence_start();
+
+    report("T2 motion", (motion_id > 0) ? E_OK : motion_id);
+    report("T3 line", (line_id > 0) ? E_OK : line_id);
+    report("T6 nav", (nav_id > 0) ? E_OK : nav_id);
+    report("T5 obstacle", (obs_id > 0) ? E_OK : obs_id);
+    report("T4 imu", (imu_id > 0) ? E_OK : imu_id);
+    report("T1 telemetry", (tlm_id > 0) ? E_OK : tlm_id);
+    report("evidence", (ev_id >= 0) ? E_OK : ev_id);
+
+    if (0 == APP_ULTRASONIC_FITTED)
+    {
+        (void)tm_printf((UB *)"T5 obstacle: not fitted, not started\n");
+    }
+
+    if (0 == APP_IMU_FITTED)
+    {
+        (void)tm_printf((UB *)"T4 imu: not fitted, not started\n");
+    }
+
+    /* T1 is optional: the car runs without it. T4 and T5 are required
+     * only when their sensor is fitted (app_cfg.h). */
+    if ((motion_id <= 0) || (line_id <= 0) || (nav_id <= 0) ||
+        ((0 != APP_ULTRASONIC_FITTED) && (obs_id <= 0)) ||
+        ((0 != APP_IMU_FITTED) && (imu_id <= 0)))
+    {
+        err = E_SYS;
+    }
+    else
+    {
+        err = rtos_obj_start_cyclic(motion_id, line_id, imu_id);
+        report("rtos_obj_start_cyclic", err);
+    }
+
+    return err;
+}
+
+/*!
+ * @brief Print a kernel error code if a start-up step failed.
+ */
+static void
+report (char const * p_what, ER err)
+{
+    if (err < E_OK)
+    {
+        (void)tm_printf((UB *)"ERROR %s: %d\n", p_what, (INT)err);
+    }
+}
+
+/*** end of file ***/
