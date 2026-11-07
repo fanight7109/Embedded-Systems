@@ -10,8 +10,8 @@
  * thresholds that follow the paper (barcode_slice()). Every change of
  * colour is timestamped with both the time and the encoder distance
  * (left + right edge counts) since the previous one. T3 drains the ring
- * once per cycle into barcode.c and reports decoded codes to T6 as
- * MSG_EV_BARCODE (unchanged interface).
+ * once per cycle into barcode.c and reports every decoded code to T6 as
+ * MSG_EV_BARCODE, with its symbol; nocmd = 1 for a symbol outside A..D.
  *
  * Trace: the ISR also keeps the last APP_BC_TRACE_BINS distance bins of
  * blackness and colour. T3 copies them out when a capture ends (or on

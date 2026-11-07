@@ -158,7 +158,8 @@ static volatile uint8_t  g_bc_trace_req = 0u;   /* Written only by T1.    */
 static void     handle_outcome(bc_ctx_t * p_ctx, uint8_t out,
                                barcode_result_t const * p_result);
 static void     count_reject(bc_ctx_t * p_ctx);
-static void     send_barcode(uint8_t cmd, uint8_t dir);
+static void     send_barcode(uint8_t cmd, uint8_t dir, char symbol,
+                             bool b_cmd);
 static uint16_t encoder_sum(void);
 static uint16_t abs_diff(uint16_t now, uint16_t before);
 static uint16_t mm_to_counts(uint32_t distance_mm);
@@ -709,8 +710,11 @@ handle_outcome (bc_ctx_t * p_ctx, uint8_t out,
             p_ctx->last_cmd = (uint8_t)(cmd & CMD_MASK);
             p_ctx->last_dir = (uint8_t)(dir & DIR_MASK);
             p_ctx->b_new    = 1u;
-            send_barcode(p_ctx->last_cmd, p_ctx->last_dir);
         }
+
+        /* Report every read, command or not, so the dashboard shows it. */
+        send_barcode((uint8_t)(cmd & CMD_MASK), (uint8_t)(dir & DIR_MASK),
+                     p_result->symbol, b_cmd);
 
 #if (1 == APP_BC_LOG)
         (void)tm_printf((UB *)"bc: *%c* %s, %s, by %s (%d el)\n",
@@ -747,11 +751,22 @@ count_reject (bc_ctx_t * p_ctx)
     }
 }
 
+/*!
+ * @brief Report a decoded code to T6 (and so to MQTT).
+ *
+ * @param[in] cmd     MSG_BC_* (0 when b_cmd is false).
+ * @param[in] dir     1 = read in reverse.
+ * @param[in] symbol  Decoded Code 39 character (7-bit ASCII).
+ * @param[in] b_cmd   true if the symbol maps to a navigation command.
+ */
 static void
-send_barcode (uint8_t cmd, uint8_t dir)
+send_barcode (uint8_t cmd, uint8_t dir, char symbol, bool b_cmd)
 {
+    /* Cast: Code 39 characters are 7-bit ASCII; the mask keeps 7 bits. */
     msg_nav_t msg = { .event = MSG_EV_BARCODE, .value = 0u, .small_a = cmd,
-                      .small_b = dir };
+                      .small_b = dir,
+                      .small_c = (uint8_t)((uint8_t)symbol & MSG_BC_SYM_MASK),
+                      .small_d = b_cmd ? 0u : 1u };
     uint8_t   buf[MSG_NAV_MAX_BYTES];
     uint8_t   len = msg_nav_pack(&msg, buf);
 

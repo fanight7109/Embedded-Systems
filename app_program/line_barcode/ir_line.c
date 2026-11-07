@@ -31,10 +31,11 @@
 #define PERIOD_US           ((uint32_t)APP_LINE_PERIOD_MS * 1000u)
 #define LOST_SAMPLES        (APP_LINE_LOST_MS / APP_LINE_PERIOD_MS)
 #define ALIGN_SAMPLES       (APP_EDGE_ALIGN_MS / APP_LINE_PERIOD_MS)
+#define SIDE_LEFT_SAMPLES   (2u)      /* Whitish GP26 samples -> left.  */
 #define NORM_FULL           (1000)
 #define NORM_HALF           (500)
 #define SEEN_SUM            (300)
-#define ERR_FULL_HALF_MM    (63)
+#define ERR_FULL_HALF_MM    (APP_LINE_ERR_FULL)
 #define ADC_MAX             (4095u)
 #define TLM_DIVIDER         (10u)       /* 20 ms x 10 = 5 Hz.             */
 #define IR_BIT_L            (0x4u)
@@ -68,6 +69,8 @@ typedef struct
     uint8_t    align_cnt;              /* Edge-reached hold, samples.    */
     int16_t    prev_off;               /* Last left-sensor offset.       */
     uint8_t    b_jct_dark;             /* Both sensors junction-dark.    */
+    uint8_t    b_right_hint;           /* Side the line went: 1 right.   */
+    uint8_t    left_cnt;               /* Whitish GP26 samples in a row. */
 } ir_ctx_t;
 
 static ir_ctx_t g_ir;
@@ -213,9 +216,9 @@ run_cycle (ir_ctx_t * p_ctx)
     if (IR_LINE_ST_CALIBRATE != p_ctx->flags.line_state)
     {
 #if (1 == APP_LINE_EDGE_FOLLOW)
-        /* An all-white left sensor still means "edge to the right", so
-         * the error stays valid for steering; T6 decides the line is lost
-         * (LINE_LOST after APP_LINE_LOST_MS without it). */
+        /* An all-white left sensor still steers (towards the side the
+         * line went, see sample_line()), so the error stays valid; T6
+         * decides the line is lost (LINE_LOST after APP_LINE_LOST_MS). */
         bool const b_valid = true;
 #else
         bool const b_valid = b_seen;
@@ -310,22 +313,66 @@ sample_line (ir_ctx_t * p_ctx, bool * p_black_l, bool * p_black_c,
     {
         bool const    b_dark = (n_l > APP_JCT_BLACK) &&
                                (n_c > APP_JCT_BLACK);
+        bool const    b_l_seen = (n_l > APP_EDGE_SEEN);
+
+        /* Side the line went, for steering while GP26 is white and for
+         * the search after LINE_LOST (bench, 2 Nov):
+         * - GP26 deep black: the line moved right (GP26 crossing it).
+         * - GP26 whitish (seen, below the edge band) for two samples, or
+         *   GP27 black with GP26 not deep black (left bend): left.
+         * - Junction-dark or both white: hold the side seen last.
+         * Two whitish samples are needed so the one grey sample GP26 may
+         * give while crossing the line's far edge does not flip it. */
+        if (b_dark)
+        {
+            p_ctx->left_cnt = 0u;           /* Cross bar: hold. */
+        }
+        else if (n_l > APP_JCT_BLACK)
+        {
+            p_ctx->b_right_hint = 1u;
+            p_ctx->left_cnt     = 0u;
+        }
+        else if (*p_black_c)
+        {
+            p_ctx->b_right_hint = 0u;
+            p_ctx->left_cnt     = 0u;
+        }
+        else if (b_l_seen && (n_l < (APP_EDGE_TARGET - APP_EDGE_ALIGN_TOL)))
+        {
+            if (p_ctx->left_cnt < SIDE_LEFT_SAMPLES)
+            {
+                p_ctx->left_cnt++;
+            }
+
+            if (SIDE_LEFT_SAMPLES == p_ctx->left_cnt)
+            {
+                p_ctx->b_right_hint = 0u;
+            }
+        }
+        else
+        {
+            p_ctx->left_cnt = 0u;           /* On the edge, or white. */
+        }
 #if (1 == APP_EDGE_RIGHT)
-        /* Right edge: blacker than the target = line further right. The
-         * centre sensor black (not a junction) with the left one whitish
-         * means the car drifted left past the line: full right. */
-        int16_t const off = (*p_black_c && (!b_dark) &&
-                             (n_l < APP_EDGE_TARGET)) ?
-                            (int16_t)APP_EDGE_TARGET :
-                            (int16_t)(n_l - APP_EDGE_TARGET);
+        /* Right edge: blacker than the target = line further right,
+         * whiter = further left. With GP26 off the line (white), steer
+         * full towards the side the line went (full left needs no
+         * forcing: n_l - target is already -target). */
+        bool const    b_forced = (0u != p_ctx->b_right_hint) && (!b_dark) &&
+                                 (!b_l_seen);
+        int16_t const off = b_forced ? (int16_t)APP_EDGE_TARGET :
+                                       (int16_t)(n_l - APP_EDGE_TARGET);
 #else
+        bool const    b_forced = false;
         int16_t const off = (int16_t)(APP_EDGE_TARGET - n_l);
 #endif
         bool const    b_on_edge = (off <= APP_EDGE_ALIGN_TOL) &&
                                   (off >= -APP_EDGE_ALIGN_TOL);
 
         p_ctx->b_jct_dark = b_dark ? 1u : 0u;
-        *p_seen    = (n_l > APP_EDGE_SEEN) || *p_black_c;
+        /* Fix B: only the left sensor keeps the line "seen"; the centre
+         * one alone (GP27 trap) lets LINE_LOST fire after 200 ms. */
+        *p_seen    = b_l_seen;
         p_ctx->err = b_dark ? 0 :
                      (int16_t)(((int32_t)off * ERR_FULL_HALF_MM) /
                                APP_EDGE_TARGET);
@@ -345,7 +392,8 @@ sample_line (ir_ctx_t * p_ctx, bool * p_black_l, bool * p_black_c,
             /* Not at the edge. */
         }
 
-        p_ctx->prev_off = off;
+        /* A forced value is not a sensor offset: no edge crossing. */
+        p_ctx->prev_off = b_forced ? 0 : off;
         gb_edge_aligned = (p_ctx->align_cnt > 0u);
     }
 #else
@@ -407,7 +455,8 @@ update_calibration (ir_ctx_t * p_ctx)
 
 /*!
  * @brief Region A: LINE_LOST after APP_LINE_LOST_MS without the line,
- *        LINE_FOUND after 3 black samples, JUNCTION after 3 samples with
+ *        LINE_FOUND after 3 black samples (left sensor only in
+ *        single-edge mode), JUNCTION after 3 samples with
  *        both sensors junction-dark (b_jct_dark, set in sample_line()).
  */
 static void
@@ -436,9 +485,17 @@ line_state_machine (ir_ctx_t * p_ctx, bool b_black_l, bool b_black_c,
             }
             else if ((p_ctx->flags.white_cnt + 1u) >= LOST_SAMPLES)
             {
+#if (1 == APP_LINE_EDGE_FOLLOW)
+                uint8_t const dir = (0u != p_ctx->b_right_hint) ?
+                                    MSG_DIR_RIGHT : MSG_DIR_LEFT;
+#else
+                uint8_t const dir = (p_ctx->err > 0) ?
+                                    MSG_DIR_RIGHT : MSG_DIR_LEFT;
+#endif
+
                 p_ctx->flags.line_state = IR_LINE_ST_LOST;
                 p_ctx->flags.black_cnt  = 0u;
-                send_simple(MSG_EV_LINE_LOST, 0u, 0u, 0u);
+                send_simple(MSG_EV_LINE_LOST, 0u, dir, 0u);
             }
             else
             {
@@ -455,7 +512,14 @@ line_state_machine (ir_ctx_t * p_ctx, bool b_black_l, bool b_black_c,
         break;
 
         case IR_LINE_ST_LOST:
+#if (1 == APP_LINE_EDGE_FOLLOW)
+            /* Fix A: found only by the left sensor (GP26), so a search
+             * never resumes with GP27 alone on the line's far edge. */
+            (void)b_black_c;
+            p_ctx->flags.black_cnt = b_black_l ?
+#else
             p_ctx->flags.black_cnt = (b_black_l || b_black_c) ?
+#endif
                 ((p_ctx->flags.black_cnt < APP_LINE_FOUND_SAMPLES) ?
                  (p_ctx->flags.black_cnt + 1u) : p_ctx->flags.black_cnt) : 0u;
 
