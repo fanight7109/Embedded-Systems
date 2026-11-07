@@ -1,0 +1,1010 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IS05 Car Dashboard</title>
+<!--
+  IS05 web dashboard. Served by tools/dashboard_web.py (open http://localhost:8080).
+  Opened as a file it connects to the bridge URL set in the header.
+  Shows: raw MQTT frames from Mosquitto, dashboard.py log lines, decoded
+  telemetry, barcode results, the GP28 barcode sensor's AO reading (MQTT
+  diag); sends start / stop / estop / set / get / diag.
+-->
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0f1012;
+  --panel: #17181b;
+  --panel-2: #1e2024;
+  --line: #2a2c31;
+  --text: #ecebe8;
+  --text-2: #a9a8a2;
+  --muted: #74736e;
+  --accent: #3987e5;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --good: #2fb36d;
+  --warn: #e0a100;
+  --bad: #e5484d;
+  --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  --sans: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.4 var(--sans); }
+button, input, select { font: inherit; color: inherit; }
+.wrap { max-width: 1600px; margin: 0 auto; padding: 12px 16px 24px; }
+
+/* Header */
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+  padding: 10px 14px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; }
+header h1 { font-size: 16px; margin: 0 8px 0 0; letter-spacing: .02em; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+  border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line);
+  font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.dot.ok { background: var(--good); } .dot.warn { background: var(--warn); }
+.dot.bad { background: var(--bad); }
+.sys { margin-left: auto; display: flex; align-items: baseline; gap: 8px; }
+.sys .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: .08em; }
+.sys .val { font: 600 20px var(--mono); }
+.bridge-url { display: flex; gap: 6px; align-items: center; font-size: 12px;
+  color: var(--muted); }
+.bridge-url[hidden] { display: none; }
+.bridge-url input { width: 190px; padding: 3px 8px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; font: 12px var(--mono); }
+
+/* Layout */
+.grid { display: grid; gap: 12px; margin-top: 12px;
+  grid-template-columns: 340px minmax(0, 1fr); }
+.col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.bottom { display: grid; gap: 12px; margin-top: 12px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+@media (max-width: 1100px) {
+  .grid, .bottom { grid-template-columns: 1fr; }
+  .sys { margin-left: 0; }
+}
+.card { background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 12px 14px; min-width: 0; }
+.card h2 { margin: 0 0 10px; font-size: 12px; font-weight: 600;
+  color: var(--text-2); text-transform: uppercase; letter-spacing: .08em;
+  display: flex; align-items: center; gap: 8px; }
+.card h2 .sp { flex: 1; }
+
+/* Controls */
+.btns { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.btn { border: 1px solid var(--line); background: var(--panel-2);
+  border-radius: 8px; padding: 8px 10px; cursor: pointer; font-weight: 600; }
+.btn:hover { border-color: #3a3d44; background: #25282d; }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.go { background: #173d29; border-color: #22603f; color: #c9f5da; }
+.btn.go:hover { background: #1c4c33; }
+.btn.stop { background: #3f3216; border-color: #6b5420; color: #fbe6b4; }
+.btn.stop:hover { background: #4d3d1b; }
+.btn.estop { background: #4a1719; border-color: #7d2427; color: #ffd4d5; }
+.btn.estop:hover { background: #5c1c1f; }
+.btn.big { padding: 14px 10px; font-size: 15px; }
+.btn.sm { padding: 4px 10px; font-weight: 500; font-size: 13px; }
+.hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.speed { margin-top: 14px; }
+.speed-row { display: flex; align-items: center; gap: 10px; }
+.speed-val { font: 600 22px var(--mono); min-width: 64px; }
+.speed-val small { font-size: 12px; color: var(--muted); font-weight: 400; }
+input[type=range] { flex: 1; accent-color: var(--accent); }
+.tune { display: grid; grid-template-columns: auto 1fr auto; gap: 6px 8px;
+  align-items: center; margin-top: 12px; }
+.tune label { font: 12px var(--mono); color: var(--text-2); }
+.tune input { width: 100%; padding: 4px 8px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); }
+details summary { cursor: pointer; color: var(--text-2); font-size: 13px;
+  margin-top: 12px; }
+.ack { margin-top: 12px; padding: 8px 10px; border-radius: 8px;
+  background: var(--bg); border: 1px solid var(--line); font: 12px var(--mono);
+  color: var(--text-2); min-height: 34px; }
+.ack.ok { border-color: #22603f; color: #c9f5da; }
+.ack.bad { border-color: #7d2427; color: #ffd4d5; }
+
+/* Barcode */
+.bc-main { display: flex; align-items: center; gap: 14px; }
+.bc-glyph { width: 76px; height: 76px; border-radius: 12px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  display: grid; place-items: center; flex: none; }
+.bc-glyph svg { width: 46px; height: 46px; stroke: var(--text);
+  stroke-width: 2.4; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.bc-glyph.fresh { border-color: var(--accent); box-shadow: 0 0 0 3px #3987e533; }
+.bc-cmd { font: 700 26px var(--mono); letter-spacing: .02em; }
+.bc-meta { font-size: 12px; color: var(--text-2); }
+.bc-hist { margin: 12px 0 0; padding: 0; list-style: none; max-height: 150px;
+  overflow: auto; font: 12px var(--mono); }
+.bc-hist li { display: flex; gap: 10px; padding: 4px 0;
+  border-top: 1px solid var(--line); color: var(--text-2); }
+.bc-hist li b { color: var(--text); font-weight: 600; min-width: 74px; }
+.bc-latched { margin-top: 8px; font-size: 12px; color: var(--muted); }
+
+/* Barcode sensor (GP28 AO, MQTT diag) */
+.bs-main { display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 10px; }
+.bs-val { font: 700 30px var(--mono); line-height: 1.1; }
+.bs-state { font: 600 12px var(--mono); padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--text-2);
+  white-space: nowrap; }
+.bs-state.black { background: #000; color: #fff; border-color: #555; }
+.bs-state.white { background: #ecebe8; color: #111; border-color: #ecebe8; }
+.bs-bar { position: relative; height: 24px; margin-top: 12px; border-radius: 6px;
+  border: 1px solid var(--line);
+  background: linear-gradient(90deg, #ecebe8, #0b0b0c); }
+.bs-band { position: absolute; top: 0; bottom: 0; background: #3987e540;
+  border-left: 1px dashed var(--accent); border-right: 1px dashed var(--accent); }
+.bs-mark { position: absolute; top: -4px; bottom: -4px; width: 2px;
+  margin-left: -1px; }
+.bs-mark.cal { background: var(--warn); }
+.bs-mark.me { background: var(--good); }
+.bs-needle { position: absolute; top: -6px; bottom: -6px; width: 4px;
+  margin-left: -2px; border-radius: 2px; background: var(--accent);
+  box-shadow: 0 0 0 2px var(--panel); transition: left .25s; }
+.bs-trace { position: relative; margin-top: 12px; }
+.bs-trace canvas { height: 170px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--bg); }
+.bs-trace-meta { font: 11px var(--mono); color: var(--muted); margin-top: 6px;
+  min-height: 1.3em; word-break: break-all; white-space: pre-wrap; }
+.bs-scale { display: flex; justify-content: space-between; margin-top: 6px;
+  font: 11px var(--mono); color: var(--muted); }
+.bs-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px;
+  font-size: 12px; color: var(--text-2); }
+.bs-legend i { display: inline-block; width: 10px; height: 10px;
+  border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.bs-tiles { margin-top: 10px; grid-template-columns: 1fr 1fr; }
+.bs-sub { margin-top: 12px; font-size: 11px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .06em; }
+.bs-cfg { margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+  background: var(--bg); border: 1px solid var(--line); font: 12px var(--mono);
+  color: var(--text-2); white-space: pre-wrap; }
+.btn.on { border-color: var(--accent); background: #3987e522; color: var(--text); }
+
+/* Telemetry tiles */
+.tiles { display: grid; gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+.tile { background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; }
+.tile .k { font-size: 11px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: .06em; }
+.tile .v { font: 600 18px var(--mono); margin-top: 2px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.tile .v small { font-size: 12px; color: var(--muted); font-weight: 400; }
+.ir { display: flex; gap: 6px; margin-top: 6px; }
+.ir span { width: 18px; height: 18px; border-radius: 4px;
+  border: 1px solid var(--line); background: var(--bg); }
+.ir span.on { background: var(--text); }
+.substates { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px;
+  font: 12px var(--mono); color: var(--text-2); }
+.substates span { background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 2px 8px; }
+.faults { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+.fault { font: 12px var(--mono); padding: 2px 8px; border-radius: 6px;
+  background: #4a1719; border: 1px solid #7d2427; color: #ffd4d5; }
+.nofault { font-size: 12px; color: var(--muted); }
+
+/* Charts */
+.charts { display: grid; gap: 12px; grid-template-columns: 1fr 1fr;
+  margin-top: 12px; }
+@media (max-width: 760px) { .charts { grid-template-columns: 1fr; } }
+.chart { position: relative; }
+.chart .ttl { font-size: 12px; color: var(--text-2); margin-bottom: 4px;
+  display: flex; gap: 12px; align-items: center; }
+.legend { display: inline-flex; align-items: center; gap: 5px;
+  color: var(--text-2); }
+.legend i { width: 12px; height: 2px; border-radius: 1px; display: inline-block; }
+canvas { width: 100%; height: 150px; display: block; }
+.tip { position: absolute; pointer-events: none; background: #0b0b0c;
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px;
+  font: 12px var(--mono); color: var(--text); white-space: nowrap;
+  display: none; z-index: 2; }
+
+/* Logs */
+.toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  margin-bottom: 8px; }
+.chip { font-size: 12px; padding: 2px 9px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel-2);
+  color: var(--text-2); cursor: pointer; user-select: none; }
+.chip.on { color: var(--text); border-color: var(--accent);
+  background: #3987e522; }
+.toolbar input[type=search] { flex: 1; min-width: 120px; padding: 3px 8px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  font-size: 12px; }
+.log { height: 340px; overflow: auto; background: #0b0c0d;
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px;
+  font: 12px/1.5 var(--mono); white-space: pre; }
+.log div { color: var(--text-2); }
+.log .t { color: var(--muted); }
+.log .tp { color: #7fb0ee; }
+.log .cmd { color: #c9f5da; }
+.log .sys { color: var(--muted); font-style: italic; }
+.log .ev { color: #fbe6b4; }
+.log .err { color: #ffb3b5; }
+.log .ackok { color: #9ee6bb; }
+.count { font: 11px var(--mono); color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>IS05 Car Dashboard</h1>
+    <span class="pill" title="Browser to dashboard_web.py"><span class="dot" id="dotBridge"></span>Bridge <b id="txtBridge">connecting</b></span>
+    <span class="pill" title="dashboard_web.py to Mosquitto"><span class="dot" id="dotBroker"></span>Broker <b id="txtBroker">?</b></span>
+    <span class="pill" title="is05/car/status (retained, last will)"><span class="dot" id="dotCar"></span>Car <b id="txtCar">?</b></span>
+    <span class="pill" title="is05/car/heartbeat"><span class="dot" id="dotHb"></span>Heartbeat <b id="txtHb">none</b></span>
+    <span class="bridge-url" id="bridgeBox" hidden>Bridge
+      <input id="bridgeUrl" spellcheck="false">
+      <button class="btn sm" id="bridgeGo">Connect</button></span>
+    <div class="sys"><span class="lbl">System</span><span class="val" id="sysState">-</span></div>
+  </header>
+
+  <div class="grid">
+    <div class="col">
+      <section class="card">
+        <h2>Control</h2>
+        <div class="btns">
+          <button class="btn go big" data-cmd="start">START</button>
+          <button class="btn stop big" data-cmd="stop">STOP</button>
+          <button class="btn estop big" data-cmd="estop">E-STOP</button>
+        </div>
+        <div class="hint">Esc key sends E-STOP.</div>
+        <div class="speed-row" style="margin-top:10px; flex-wrap:wrap; gap:8px">
+          <button class="btn sm" id="driveGo" title="Barcode test: straight at base speed, line ignored, then STOPPED">Drive straight (barcode test)</button>
+          <span style="white-space:nowrap"><input id="driveMm" type="number" min="1" max="1023" step="10" value="600" style="width:70px" aria-label="Drive distance, mm"> <small>mm</small></span>
+        </div>
+        <div class="speed">
+          <div class="speed-row">
+            <span class="speed-val"><span id="spdVal">100</span> <small>mm/s</small></span>
+            <input type="range" id="spd" min="100" max="300" step="10" value="100" aria-label="Base speed">
+          </div>
+          <div class="speed-row" style="margin-top:8px">
+            <button class="btn sm" id="spdSet">Set base speed</button>
+            <button class="btn sm" id="spdGet">Read from car</button>
+            <label class="hint" style="margin:0"><input type="checkbox" id="spdLive"> send on release</label>
+          </div>
+          <div class="hint">100 to 300 mm/s. Live while driving (slews 10 mm/s per 100 ms) or in STOPPED.</div>
+        </div>
+        <details>
+          <summary>PID and thresholds</summary>
+          <div class="tune">
+            <label for="kp">kp</label><input id="kp" type="number" step="0.01" min="0" max="10" placeholder="0.00 to 10.00"><button class="btn sm" data-set="kp">Set</button>
+            <label for="ki">ki</label><input id="ki" type="number" step="0.01" min="0" max="10" placeholder="0.00 to 10.00"><button class="btn sm" data-set="ki">Set</button>
+            <label for="kd">kd</label><input id="kd" type="number" step="0.01" min="0" max="10" placeholder="0.00 to 10.00"><button class="btn sm" data-set="kd">Set</button>
+            <label for="obstacle_mm">obstacle_mm</label><input id="obstacle_mm" type="number" step="10" min="150" max="400" placeholder="150 to 400"><button class="btn sm" data-set="obstacle_mm">Set</button>
+            <label for="hump_pitch_deg">hump_deg</label><input id="hump_pitch_deg" type="number" step="1" min="2" max="10" placeholder="2 to 10"><button class="btn sm" data-set="hump_pitch_deg">Set</button>
+          </div>
+          <div class="hint">obstacle_mm and hump_deg are accepted in READY only.</div>
+          <div class="speed-row" style="margin-top:8px; flex-wrap:wrap">
+            <button class="btn sm" data-get="kp">Get kp</button>
+            <button class="btn sm" data-get="ki">Get ki</button>
+            <button class="btn sm" data-get="kd">Get kd</button>
+            <button class="btn sm" data-get="ir_cal_l">IR cal L</button>
+            <button class="btn sm" data-get="ir_cal_c">IR cal C</button>
+          </div>
+        </details>
+        <div class="ack" id="ack">No command sent yet.</div>
+      </section>
+
+      <section class="card">
+        <h2>Barcode received<span class="sp"></span><span class="count" id="bcCount">0 reads</span></h2>
+        <div class="bc-main">
+          <div class="bc-glyph" id="bcGlyph"><svg viewBox="0 0 48 48" id="bcSvg"><path d="M10 24h28" stroke-dasharray="3 5"/></svg></div>
+          <div>
+            <div class="bc-cmd" id="bcCmd">None yet</div>
+            <div class="bc-meta" id="bcMeta">Waiting for a BARCODE event</div>
+          </div>
+        </div>
+        <ul class="bc-hist" id="bcHist"></ul>
+        <div class="bc-latched" id="bcLatched">Telemetry latch: -</div>
+      </section>
+
+      <section class="card">
+        <h2>Barcode sensor, GP28 AO<span class="sp"></span><span class="count" id="bsAge">not read</span></h2>
+        <div class="bs-main">
+          <div><div class="bs-val" id="bsRaw">-</div><div class="bc-meta">ADC counts, 0 to 4095, higher = blacker</div></div>
+          <span class="bs-state" id="bsState">-</span>
+        </div>
+        <div class="bs-bar" title="0 (white) to 4095 (black)">
+          <div class="bs-band" id="bsBand" hidden></div>
+          <i class="bs-mark cal" id="mkCalW" hidden title="Calibration min (white)"></i>
+          <i class="bs-mark cal" id="mkCalB" hidden title="Calibration max (black)"></i>
+          <i class="bs-mark me" id="mkMyW" hidden title="Your white sample"></i>
+          <i class="bs-mark me" id="mkMyB" hidden title="Your black sample"></i>
+          <i class="bs-needle" id="bsNeedle" hidden title="Live reading"></i>
+        </div>
+        <div class="bs-scale"><span>0 white</span><span>2048</span><span>4095 black</span></div>
+        <div class="bs-legend">
+          <span><i style="background:var(--accent)"></i>live</span>
+          <span><i style="background:#3987e540;border:1px dashed var(--accent)"></i>threshold band</span>
+          <span><i style="background:var(--warn)"></i>calibration min/max</span>
+          <span><i style="background:var(--good)"></i>your samples</span>
+        </div>
+        <div class="speed-row" style="margin-top:10px; flex-wrap:wrap">
+          <button class="btn sm" id="bsLive">Start live</button>
+          <button class="btn sm" id="bsOnce">Read once</button>
+          <button class="btn sm" id="bsCal">Read calibration</button>
+        </div>
+        <div class="tiles bs-tiles">
+          <div class="tile"><div class="k">Cal white (min)</div><div class="v" id="bsCalW">-</div></div>
+          <div class="tile"><div class="k">Cal black (max)</div><div class="v" id="bsCalB">-</div></div>
+          <div class="tile"><div class="k">Black above</div><div class="v" id="bsOn">-</div></div>
+          <div class="tile"><div class="k">White below</div><div class="v" id="bsOff">-</div></div>
+        </div>
+        <div class="bs-sub">Your samples</div>
+        <div class="speed-row" style="margin-top:6px; flex-wrap:wrap">
+          <button class="btn sm" id="bsMarkW">Save as white</button>
+          <button class="btn sm" id="bsMarkB">Save as black</button>
+          <button class="btn sm" id="bsMarkClr">Clear</button>
+        </div>
+        <div class="tiles bs-tiles">
+          <div class="tile"><div class="k">White</div><div class="v" id="bsMyW">-</div></div>
+          <div class="tile"><div class="k">Black</div><div class="v" id="bsMyB">-</div></div>
+        </div>
+        <div class="bs-cfg" id="bsCfg">Save a white and a black sample to get the app_cfg.h thresholds.</div>
+        <div class="hint" id="bsMsg">Start live, hold the sensor over the black line, then over the white floor.</div>
+        <div class="bs-sub" style="display:flex;align-items:center;gap:8px">Whole barcode (trace)<span class="sp" style="flex:1"></span>
+          <button class="btn sm" id="bsTraceGet" title="Send the last ~0.5 m the sensor drove over">Get trace</button></div>
+        <div class="bs-trace"><canvas id="bsTraceCv"></canvas></div>
+        <div class="bs-trace-meta" id="bsTraceMeta">Drive over a barcode: the car sends its trace ~4 cm after it, or press Get trace. Shaded = read as black.</div>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="card">
+        <h2>Telemetry<span class="sp"></span><span class="count" id="tlmAge">no data</span></h2>
+        <div class="tiles">
+          <div class="tile"><div class="k">Speed L</div><div class="v" id="tSpdL">-</div></div>
+          <div class="tile"><div class="k">Speed R</div><div class="v" id="tSpdR">-</div></div>
+          <div class="tile"><div class="k">Distance</div><div class="v" id="tDist">-</div></div>
+          <div class="tile"><div class="k">Line error</div><div class="v" id="tErr">-</div></div>
+          <div class="tile"><div class="k">IR bits</div><div class="ir" id="tIr"><span></span><span></span><span></span></div></div>
+          <div class="tile"><div class="k">Encoders L / R</div><div class="v" id="tEnc">-</div></div>
+          <div class="tile"><div class="k">Hump cur / max</div><div class="v" id="tHump">-</div></div>
+          <div class="tile"><div class="k">Obstacle</div><div class="v" id="tObs">-</div></div>
+          <div class="tile"><div class="k">Car time</div><div class="v" id="tTime">-</div></div>
+          <div class="tile"><div class="k">Dropped</div><div class="v" id="tDrop">-</div></div>
+        </div>
+        <div class="substates" id="tSub"></div>
+        <div class="faults" id="tFlt"><span class="nofault">No faults</span></div>
+        <div class="charts">
+          <div class="chart">
+            <div class="ttl">Wheel speed, mm/s, last 30 s
+              <span class="legend"><i style="background:var(--series-1)"></i>L</span>
+              <span class="legend"><i style="background:var(--series-2)"></i>R</span></div>
+            <canvas id="chSpd"></canvas><div class="tip" id="tipSpd"></div>
+          </div>
+          <div class="chart">
+            <div class="ttl">Line error, mm, last 30 s</div>
+            <canvas id="chErr"></canvas><div class="tip" id="tipErr"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div class="bottom">
+    <section class="card">
+      <h2>MQTT from Mosquitto<span class="sp"></span><span class="count" id="rawCount">0 frames</span></h2>
+      <div class="toolbar" id="rawChips">
+        <span class="chip on" data-topic="telemetry">telemetry</span>
+        <span class="chip on" data-topic="heartbeat">heartbeat</span>
+        <span class="chip on" data-topic="event">event</span>
+        <span class="chip on" data-topic="ack">ack</span>
+        <span class="chip on" data-topic="status">status</span>
+        <span class="chip on" data-topic="other">other</span>
+        <button class="btn sm" id="rawPause">Pause</button>
+        <button class="btn sm" id="rawClear">Clear</button>
+      </div>
+      <div class="log" id="raw"></div>
+    </section>
+    <section class="card">
+      <h2>dashboard.py log<span class="sp"></span><span class="count" id="logCount">0 lines</span></h2>
+      <div class="toolbar">
+        <input type="search" id="logFilter" placeholder="Filter, e.g. EVENT, ACK, LINE_FOLLOW">
+        <button class="btn sm" id="logPause">Pause</button>
+        <button class="btn sm" id="logClear">Clear</button>
+        <button class="btn sm" id="logSave">Save</button>
+      </div>
+      <div class="log" id="log"></div>
+    </section>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* Name tables mirror tools/dashboard.py (and mqtt_fmt.h). */
+const SYSTEM = ["INIT", "CALIBRATE", "READY", "LINE_FOLLOW", "BARCODE_ACTION",
+  "LINE_SEARCH", "OBSTACLE", "STOPPED", "SAFE_STOP"];
+const COMMS = ["INIT", "WIFI_JOIN", "WIFI_WAIT", "MQTT_CONN", "MQTT_WAIT",
+  "ONLINE", "BACKOFF"];
+const BARCODE = ["LEFT", "RIGHT", "STRAIGHT", "U_TURN"];
+const ACK_ERR = ["NONE", "BAD_LEN", "BAD_VER", "UNKNOWN_CMD", "BAD_STATE",
+  "OUT_OF_RANGE", "DUP_SEQ"];
+const KEY_NAMES = ["base_speed", "kp", "ki", "kd", "obstacle_mm",
+  "hump_pitch_deg", "ir_cal_l", "ir_cal_c"];
+const KEY_DECODE = [v => v + 100 + " mm/s", v => (v / 100).toFixed(2),
+  v => (v / 100).toFixed(2), v => (v / 100).toFixed(2), v => v + 150 + " mm",
+  v => v + 2 + " deg", v => "~" + v * 4 + " ADC counts",
+  v => "~" + v * 4 + " ADC counts"];
+const BC_ICON = {
+  LEFT: '<path d="M34 38V22a6 6 0 0 0-6-6H12"/><path d="M19 9l-7 7 7 7"/>',
+  RIGHT: '<path d="M14 38V22a6 6 0 0 1 6-6h16"/><path d="M29 9l7 7-7 7"/>',
+  STRAIGHT: '<path d="M24 40V9"/><path d="M17 16l7-7 7 7"/>',
+  U_TURN: '<path d="M30 40V20a8 8 0 0 0-16 0v4"/><path d="M8 18l6 7 6-7"/>'
+};
+const LOG_MAX = 2000, RAW_MAX = 800, WINDOW_S = 30;
+
+const $ = id => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } }
+};
+const esc = s => String(s).replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
+const clock = ts => new Date(ts * 1000).toLocaleTimeString([], {hour12: false}) +
+  "." + String(Math.floor((ts % 1) * 1000)).padStart(3, "0");
+function setDot(id, cls) { $(id).className = "dot" + (cls ? " " + cls : ""); }
+
+/* ---------- Bridge connection ---------- */
+const servedByBridge = location.protocol.startsWith("http");
+let base = servedByBridge ? location.origin
+  : (store.get("is05.bridge") || "http://localhost:8080");
+let es = null;
+if (!servedByBridge) {
+  $("bridgeBox").hidden = false;
+  $("bridgeUrl").value = base;
+  $("bridgeGo").onclick = () => {
+    base = $("bridgeUrl").value.trim().replace(/\/+$/, "");
+    store.set("is05.bridge", base);
+    connect();
+  };
+}
+
+function connect() {
+  if (es) es.close();
+  $("txtBridge").textContent = "connecting";
+  setDot("dotBridge", "warn");
+  es = new EventSource(base + "/stream");
+  es.onopen = () => { $("txtBridge").textContent = "live"; setDot("dotBridge", "ok"); };
+  es.onerror = () => {
+    $("txtBridge").textContent = "offline (run dashboard_web.py)";
+    setDot("dotBridge", "bad");
+    $("txtBroker").textContent = "?"; setDot("dotBroker", "");
+  };
+  es.onmessage = e => {
+    let m;
+    try { m = JSON.parse(e.data); } catch (err) { return; }
+    if (m.type === "frame") onFrame(m);
+    else if (m.type === "bridge") onBridge(m);
+    else if (m.type === "bctrace") onTrace(m);
+    else addLog(m);
+  };
+}
+
+function onBridge(m) {
+  $("txtBroker").textContent = (m.connected ? "" : "down ") + m.broker;
+  setDot("dotBroker", m.connected ? "ok" : "bad");
+}
+
+/* ---------- Commands ---------- */
+const pending = {};   // seq -> label, so ACKs read as "start OK"
+const early = {};     // ACKs that beat the POST reply
+async function send(args, quiet) {
+  // quiet: barcode sensor polls; their ACKs go to that card, not the box.
+  const label = args.join(" ");
+  if (!quiet) {
+    $("ack").className = "ack";
+    $("ack").textContent = "Sending " + label + " ...";
+  }
+  try {
+    const r = await fetch(base + "/cmd", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({args})});
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error);
+    pending[j.seq] = label;
+    if (early[j.seq]) { const a = early[j.seq]; delete early[j.seq]; onAck(a); }
+    else if (!quiet) $("ack").textContent = "Sent " + label + " (seq " + j.seq + "), waiting for ACK";
+  } catch (err) {
+    if (quiet) { bsInFlight = 0; $("bsMsg").textContent = "Not sent: " + err.message; return; }
+    $("ack").className = "ack bad";
+    $("ack").textContent = "Not sent: " + err.message;
+  }
+}
+$("driveGo").onclick = () => {
+  const mm = Math.round(+$("driveMm").value);
+  if (!(mm >= 1 && mm <= 1023)) {
+    $("ack").className = "ack bad"; $("ack").textContent = "Drive distance must be 1 to 1023 mm";
+    return;
+  }
+  send(["drive", String(mm)]);
+};
+document.querySelectorAll("[data-cmd]").forEach(b =>
+  b.addEventListener("click", () => send([b.dataset.cmd])));
+document.querySelectorAll("[data-set]").forEach(b =>
+  b.addEventListener("click", () => {
+    const key = b.dataset.set, v = $(key).value;
+    if (v === "") { $(key).focus(); return; }
+    send(["set", key, v]);
+  }));
+document.querySelectorAll("[data-get]").forEach(b =>
+  b.addEventListener("click", () => send(["get", b.dataset.get])));
+$("spd").addEventListener("input", () => { $("spdVal").textContent = $("spd").value; });
+$("spd").addEventListener("change", () => { if ($("spdLive").checked) send(["set", "base_speed", $("spd").value]); });
+$("spdSet").onclick = () => send(["set", "base_speed", $("spd").value]);
+$("spdGet").onclick = () => send(["get", "base_speed"]);
+$("spdLive").checked = store.get("is05.spdLive") === "1";
+$("spdLive").onchange = () => store.set("is05.spdLive", $("spdLive").checked ? "1" : "0");
+document.addEventListener("keydown", e => {   // Esc = E-STOP
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "Escape") send(["estop"]);
+});
+
+function onAck(a) {
+  if (!(a.seq in pending)) {
+    // Our POST reply may still be on its way; else it is someone else's.
+    early[a.seq] = a;
+    setTimeout(() => {
+      if (early[a.seq] === a) { delete early[a.seq]; showAck("seq " + a.seq, a); }
+    }, 400);
+    return;
+  }
+  const label = pending[a.seq];
+  delete pending[a.seq];
+  if (label.startsWith("diag ")) { onDiag(label.slice(5), a); return; }
+  showAck(label, a);
+}
+
+function showAck(label, a) {
+  const isGet = label.startsWith("get ");
+  let txt = label + (a.ok ? "  OK" : "  REJECTED " + (ACK_ERR[a.err] || a.err));
+  if (a.ok && isGet && KEY_DECODE[a.key]) {
+    txt += "  ->  " + KEY_NAMES[a.key] + " = " + KEY_DECODE[a.key](a.val);
+    if (a.key === 0) { $("spd").value = a.val + 100; $("spdVal").textContent = a.val + 100; }
+    if (a.key >= 1 && a.key <= 3) $(KEY_NAMES[a.key]).value = (a.val / 100).toFixed(2);
+  }
+  $("ack").className = "ack " + (a.ok ? "ok" : "bad");
+  $("ack").textContent = txt;
+}
+
+/* ---------- Barcode sensor (GP28 AO, MQTT diag) ---------- */
+// Slicer offsets above the paper (APP_BC_RISE / APP_BC_FALL in app_cfg.h),
+// from a white sample and the THINNEST bar saved as black.
+const BS_RISE_PCT = 0.80, BS_FALL_PCT = 0.50, BS_MIN_SPAN = 40;
+const toNum = v => (v === null || v === "" || isNaN(+v)) ? null : +v;
+const BS = {bc_raw: null, bc_white: null, bc_black: null, bc_black_on: null,
+  bc_white_on: null, myW: toNum(store.get("is05.bsW")),
+  myB: toNum(store.get("is05.bsB")), ts: 0};
+let bsTimer = null, bsInFlight = 0;
+
+function onDiag(name, a) {
+  if (name === "bc_raw") bsInFlight = 0;
+  if (!a.ok) {
+    $("bsMsg").textContent = "diag " + name + " rejected: " + (ACK_ERR[a.err] || a.err) +
+      (a.err === 3 ? " (car firmware has no diag yet: rebuild and flash)" : "");
+    return;
+  }
+  BS[name] = a.val;
+  if (name === "bc_raw") BS.ts = Date.now() / 1000;
+  renderBs();
+}
+
+function bsPoll() {
+  if (bsInFlight && Date.now() - bsInFlight < 1500) return;   // ACK pending
+  bsInFlight = Date.now();
+  send(["diag", "bc_raw"], true);
+}
+// Live readings are also written to a CSV by the bridge (bc_logs/).
+async function bsLog(on) {
+  try {
+    const r = await fetch(base + "/bclog", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({on})});
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error);
+    $("bsMsg").textContent = on ? "Recording to " + j.path :
+      (j.path ? "Saved " + j.rows + " readings to " + j.path : "");
+  } catch (err) {
+    $("bsMsg").textContent = "Live log not recording: " + err.message +
+      " (restart tools/dashboard_web.py to get logging)";
+  }
+}
+$("bsLive").onclick = () => {
+  if (bsTimer) {
+    clearInterval(bsTimer); bsTimer = null;
+    $("bsLive").textContent = "Start live"; $("bsLive").classList.remove("on");
+    bsLog(false);
+  } else {
+    bsLog(true);
+    bsPoll(); bsTimer = setInterval(bsPoll, 500);
+    $("bsLive").textContent = "Stop live"; $("bsLive").classList.add("on");
+  }
+};
+$("bsOnce").onclick = () => send(["diag", "bc_raw"], true);
+$("bsCal").onclick = () => ["bc_white", "bc_black", "bc_black_on", "bc_white_on"]
+  .forEach(k => send(["diag", k], true));
+function bsMark(key, storeKey, what) {
+  if (BS.bc_raw === null) { $("bsMsg").textContent = "Read the sensor first (Start live)."; return; }
+  BS[key] = BS.bc_raw;
+  store.set(storeKey, String(BS.bc_raw));
+  $("bsMsg").textContent = "Saved " + BS.bc_raw + " as " + what + ".";
+  renderBs();
+}
+$("bsMarkW").onclick = () => bsMark("myW", "is05.bsW", "white");
+$("bsMarkB").onclick = () => bsMark("myB", "is05.bsB", "black");
+$("bsMarkClr").onclick = () => {
+  BS.myW = null; BS.myB = null;
+  store.set("is05.bsW", ""); store.set("is05.bsB", "");
+  renderBs();
+};
+
+function bsPlace(id, v) {
+  const el = $(id);
+  el.hidden = (v === null);
+  if (v !== null) el.style.left = (Math.max(0, Math.min(4095, v)) / 4095 * 100) + "%";
+}
+function renderBs() {
+  const raw = BS.bc_raw, on = BS.bc_black_on, off = BS.bc_white_on;
+  const show = v => v === null ? "-" : String(v);
+  $("bsRaw").textContent = show(raw);
+  $("bsCalW").textContent = show(BS.bc_white);
+  $("bsCalB").textContent = show(BS.bc_black);
+  $("bsOn").textContent = show(on);
+  $("bsOff").textContent = show(off);
+  $("bsMyW").textContent = show(BS.myW);
+  $("bsMyB").textContent = show(BS.myB);
+  bsPlace("bsNeedle", raw);
+  bsPlace("mkCalW", BS.bc_white || null);   // 0 = no calibration yet
+  bsPlace("mkCalB", BS.bc_black || null);
+  bsPlace("mkMyW", BS.myW);
+  bsPlace("mkMyB", BS.myB);
+  const band = $("bsBand");
+  band.hidden = (on === null || off === null);
+  if (!band.hidden) {
+    band.style.left = (off / 4095 * 100) + "%";
+    band.style.width = (Math.max(0, on - off) / 4095 * 100) + "%";
+  }
+  const st = $("bsState");
+  if (raw === null || on === null || off === null) {
+    st.className = "bs-state";
+    st.textContent = raw === null ? "-" : "read calibration for thresholds";
+  } else if (raw >= on) { st.className = "bs-state black"; st.textContent = "BLACK"; }
+  else if (raw <= off) { st.className = "bs-state white"; st.textContent = "WHITE"; }
+  else { st.className = "bs-state"; st.textContent = "in band (keeps colour)"; }
+  const w = BS.myW, b = BS.myB;
+  if (w === null || b === null) {
+    $("bsCfg").textContent = "Save paper as white and the thinnest bar as black to get the app_cfg.h thresholds.";
+  } else if (b <= w) {
+    $("bsCfg").textContent = "Black (" + b + ") must read higher than white (" + w +
+      "). Check the AO wiring, or set APP_IR_BLACK_IS_HIGH to 0.";
+  } else {
+    const span = b - w;
+    $("bsCfg").textContent = "contrast " + span +
+      (span < BS_MIN_SPAN ? " (low: check sensor height and the print)" : "") + "\n" +
+      "#define APP_BC_RISE             (" + Math.round(span * BS_RISE_PCT) + "u)\n" +
+      "#define APP_BC_FALL             (" + Math.round(span * BS_FALL_PCT) + "u)";
+  }
+}
+
+/* ---------- Barcode trace (is05/car/bctrace, reassembled by the bridge) ---------- */
+let bsTraceData = null, bsTraceHover = null;
+function onTrace(m) {
+  bsTraceData = m;
+  drawTrace();
+}
+function traceMeta(extra) {
+  const m = bsTraceData;
+  if (!m) return;
+  const n = m.vals.length, span = (n * m.bin_mm).toFixed(0);
+  $("bsTraceMeta").textContent = "trace " + m.id + " at " + clock(m.ts) + ": " + span +
+    " mm, " + m.bin_mm.toFixed(2) + " mm/sample" + (m.barcode ? ", read " + m.barcode : "") +
+    (m.missing ? ", " + m.missing + " frames lost (gaps)" : "") +
+    (extra ? "  |  " + extra : "") + (m.path ? "\n" + m.path : "");
+}
+function drawTrace() {
+  const cv = $("bsTraceCv"), m = bsTraceData, dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w) return;
+  if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  if (!m) return;
+  const L = 40, R = 8, T = 8, B = 18, pw = w - L - R, ph = h - T - B, n = m.vals.length;
+  let lo = Infinity, hi = -Infinity;
+  m.vals.forEach(v => { if (v !== null) { lo = Math.min(lo, v); hi = Math.max(hi, v); } });
+  if (!isFinite(lo)) { lo = 0; hi = 4095; }
+  const r = niceRange(lo, hi, 50);
+  const x = i => L + i / Math.max(1, n - 1) * pw;
+  const y = v => T + (1 - (v - r.lo) / (r.hi - r.lo)) * ph;
+  // Slicer colour: dark bands where the car called it black.
+  g.fillStyle = "rgba(150,150,150,.30)";
+  for (let i = 0; i < n; i++) {
+    if (m.black[i]) { let j = i; while (j < n && m.black[j]) j++;
+      g.fillRect(x(i), T, Math.max(1, x(j) - x(i)), ph); i = j; }
+  }
+  g.font = "11px " + css("--mono");
+  g.fillStyle = css("--muted"); g.strokeStyle = css("--line"); g.lineWidth = 1;
+  g.textAlign = "right"; g.textBaseline = "middle";
+  for (let v = r.lo; v <= r.hi + 1e-9; v += r.step) {
+    const yy = Math.round(y(v)) + .5;
+    g.beginPath(); g.moveTo(L, yy); g.lineTo(L + pw, yy); g.stroke();
+    g.fillText(+v.toFixed(0), L - 6, yy);
+  }
+  g.textAlign = "center"; g.textBaseline = "top";
+  const mmMax = n * m.bin_mm, step = mmMax > 300 ? 100 : 50;
+  for (let mm = 0; mm <= mmMax; mm += step) g.fillText(mm + " mm", x(mm / m.bin_mm), T + ph + 4);
+  g.strokeStyle = css("--accent"); g.lineWidth = 1.5; g.lineJoin = "round";
+  g.beginPath();
+  let pen = false;
+  m.vals.forEach((v, i) => {
+    if (v === null) { pen = false; return; }
+    pen ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v)); pen = true;
+  });
+  g.stroke();
+  if (bsTraceHover !== null) {
+    const i = Math.round((bsTraceHover - L) / pw * (n - 1));
+    if (i >= 0 && i < n) {
+      g.strokeStyle = css("--text-2"); g.beginPath();
+      g.moveTo(x(i) + .5, T); g.lineTo(x(i) + .5, T + ph); g.stroke();
+      traceMeta((i * m.bin_mm).toFixed(1) + " mm: " + (m.vals[i] === null ? "lost" :
+        m.vals[i] + (m.black[i] ? " (black)" : " (white)")));
+      return;
+    }
+  }
+  traceMeta("");
+}
+$("bsTraceCv").addEventListener("mousemove", e => { bsTraceHover = e.offsetX; drawTrace(); });
+$("bsTraceCv").addEventListener("mouseleave", () => { bsTraceHover = null; drawTrace(); });
+window.addEventListener("resize", drawTrace);
+$("bsTraceGet").onclick = () => {
+  send(["diag", "bc_trace"], true);
+  $("bsTraceMeta").textContent = "Trace requested: arriving in about a second...";
+};
+
+/* ---------- Frames ---------- */
+let lastTlm = 0, lastHb = 0, rawN = 0, bcN = 0;
+const spdSeries = [], errSeries = [];
+
+function onFrame(f) {
+  addRaw(f);
+  const d = f.d;
+  if (!d) return;
+  if (f.leaf === "telemetry") onTelemetry(d, f.ts);
+  else if (f.leaf === "heartbeat") {
+    lastHb = f.ts;
+    $("txtHb").textContent = (SYSTEM[d.st] || "?") + (d.crit ? " CRIT" : "") + " rcn " + d.rcn;
+  } else if (f.leaf === "status") {
+    $("txtCar").textContent = d.online ? "ONLINE" : "OFFLINE";
+    setDot("dotCar", d.online ? "ok" : "bad");
+  } else if (f.leaf === "ack") onAck(d);
+  else if (f.leaf === "event" && d.name === "BARCODE") onBarcode(d, f.ts);
+}
+
+function onTelemetry(t, ts) {
+  lastTlm = ts;
+  const st = t.state;
+  $("sysState").textContent = SYSTEM[st.system] || "?";
+  $("tSpdL").innerHTML = t.spd_l + " <small>mm/s</small>";
+  $("tSpdR").innerHTML = t.spd_r + " <small>mm/s</small>";
+  $("tDist").innerHTML = t.dist + " <small>mm</small>";
+  $("tErr").innerHTML = (t.err_mm >= 0 ? "+" : "") + t.err_mm.toFixed(1) + " <small>mm</small>";
+  [...$("tIr").children].forEach((s, i) => s.classList.toggle("on", !!(t.ir & (4 >> i))));
+  $("tIr").title = "ir=" + t.ir.toString(2).padStart(3, "0");
+  $("tEnc").textContent = t.enc_l + " / " + t.enc_r;
+  $("tHump").innerHTML = t.hump_cur + " / " + t.hump_max + " <small>mm</small>";
+  $("tObs").innerHTML = t.obs_d === 2047 ? "none" : t.obs_d + " <small>mm, brg " + t.obs_brg + "</small>";
+  $("tTime").innerHTML = (t.t * 10 / 1000).toFixed(2) + " <small>s</small>";
+  $("tDrop").textContent = t.drop;
+  $("tSub").innerHTML = ["comms " + (COMMS[st.comms] || st.comms), "motion " + st.motion,
+    "mode " + st.mode, "line " + st.line, "barcode " + st.barcode,
+    "obstacle " + st.obstacle, "imu " + st.imu].map(s => "<span>" + s + "</span>").join("");
+  $("tFlt").innerHTML = t.faults.length
+    ? t.faults.map(n => '<span class="fault">' + esc(n) + "</span>").join("")
+    : '<span class="nofault">No faults</span>';
+  $("bcLatched").textContent = "Telemetry latch: " + (BARCODE[t.bc] || "?") +
+    (t.bc_dir ? " (reverse scan)" : " (forward scan)") + ". Defaults to LEFT before any read.";
+  spdSeries.push([ts, t.spd_l, t.spd_r]);
+  errSeries.push([ts, t.err_mm]);
+  trim(spdSeries); trim(errSeries);
+  drawAll();
+}
+function trim(arr) { const lim = Date.now() / 1000 - WINDOW_S - 2; while (arr.length && arr[0][0] < lim) arr.shift(); }
+
+function onBarcode(d, ts) {
+  /* Symbol read; a valid code outside A..D shows with "no command". */
+  const sym = (d.sym > 32 && d.sym < 127) ? String.fromCharCode(d.sym) : "";
+  const name = d.nocmd ? ("*" + sym + "*") : (BARCODE[d.cmd] || "?");
+  bcN += 1;
+  $("bcCount").textContent = bcN + (bcN === 1 ? " read" : " reads");
+  $("bcCmd").textContent = name;
+  $("bcMeta").textContent = clock(ts) + "  ·  " + (sym ? "*" + sym + "*" + (d.nocmd ? " (no command)" : "") + "  ·  " : "") +
+    (d.dir ? "reverse" : "forward") +
+    " scan  ·  car t=" + (d.t * 10 / 1000).toFixed(2) + " s";
+  $("bcSvg").innerHTML = BC_ICON[name] || "";
+  const g = $("bcGlyph");
+  g.classList.remove("fresh"); void g.offsetWidth; g.classList.add("fresh");
+  setTimeout(() => g.classList.remove("fresh"), 3000);
+  const li = document.createElement("li");
+  li.innerHTML = "<b>" + name + "</b><span>" + (d.nocmd ? "no cmd" : (d.dir ? "rev" : "fwd")) + "</span><span>" + clock(ts) + "</span>";
+  $("bcHist").prepend(li);
+}
+
+/* ---------- Raw MQTT panel ---------- */
+const rawOn = new Set(["telemetry", "heartbeat", "event", "ack", "status", "other"]);
+let rawPaused = false;
+document.querySelectorAll("#rawChips .chip").forEach(c => c.onclick = () => {
+  const t = c.dataset.topic;
+  rawOn.has(t) ? rawOn.delete(t) : rawOn.add(t);
+  c.classList.toggle("on", rawOn.has(t));
+});
+$("rawPause").onclick = () => { rawPaused = !rawPaused; $("rawPause").textContent = rawPaused ? "Resume" : "Pause"; };
+$("rawClear").onclick = () => { $("raw").innerHTML = ""; };
+
+function addRaw(f) {
+  rawN += 1;
+  $("rawCount").textContent = rawN + " frames";
+  const kind = ["telemetry", "heartbeat", "event", "ack", "status"].includes(f.leaf) ? f.leaf : "other";
+  if (rawPaused || !rawOn.has(kind)) return;
+  const hex = f.hex.match(/../g) ? f.hex.match(/../g).join(" ") : "";
+  appendLine($("raw"), '<span class="t">' + clock(f.ts) + '</span> <span class="tp">' +
+    esc(f.topic) + "</span> [" + f.len + "B" + (f.retain ? " R" : "") + "] " + hex, RAW_MAX);
+}
+
+/* ---------- dashboard.py log panel ---------- */
+const logLines = [];
+let logPaused = false;
+function logClass(m) {
+  if (m.type === "cmd") return "cmd";
+  if (m.type === "sys") return "sys";
+  if (/EVENT/.test(m.text)) return "ev";
+  if (/ACK .*ok=0|bad length|FAIL|faults=\[[^\]]/.test(m.text)) return "err";
+  if (/ACK .*ok=1/.test(m.text)) return "ackok";
+  return "";
+}
+function lineHtml(m) {
+  return '<div class="' + logClass(m) + '"><span class="t">' + clock(m.ts) + "</span> " + esc(m.text) + "</div>";
+}
+function addLog(m) {
+  logLines.push(m);
+  if (logLines.length > LOG_MAX * 2) logLines.splice(0, logLines.length - LOG_MAX);
+  $("logCount").textContent = logLines.length + " lines";
+  const f = $("logFilter").value.trim().toLowerCase();
+  if (logPaused || (f && !m.text.toLowerCase().includes(f))) return;
+  appendLine($("log"), lineHtml(m), LOG_MAX, true);
+}
+function appendLine(box, html, max, raw) {
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  box.insertAdjacentHTML("beforeend", raw ? html : "<div>" + html + "</div>");
+  while (box.childElementCount > max) box.firstElementChild.remove();
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+function rerenderLog() {
+  const f = $("logFilter").value.trim().toLowerCase();
+  $("log").innerHTML = logLines.filter(m => !f || m.text.toLowerCase().includes(f))
+    .slice(-LOG_MAX).map(lineHtml).join("");
+  $("log").scrollTop = $("log").scrollHeight;
+}
+$("logFilter").addEventListener("input", rerenderLog);
+$("logPause").onclick = () => {
+  logPaused = !logPaused;
+  $("logPause").textContent = logPaused ? "Resume" : "Pause";
+  if (!logPaused) rerenderLog();
+};
+$("logClear").onclick = () => { logLines.length = 0; $("log").innerHTML = ""; $("logCount").textContent = "0 lines"; };
+$("logSave").onclick = () => {
+  const blob = new Blob([logLines.map(m => m.text).join("\n") + "\n"], {type: "text/plain"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "dashboard_" + new Date().toISOString().replace(/[:.]/g, "-") + ".log";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+
+/* ---------- Charts (canvas, one y-axis each, crosshair tooltip) ---------- */
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const charts = {
+  spd: {cv: $("chSpd"), tip: $("tipSpd"), data: spdSeries, unit: "mm/s",
+    series: [{i: 1, name: "L", color: "--series-1"}, {i: 2, name: "R", color: "--series-2"}], hover: null},
+  err: {cv: $("chErr"), tip: $("tipErr"), data: errSeries, unit: "mm", zero: true,
+    series: [{i: 1, name: "err", color: "--series-1"}], hover: null}
+};
+
+function niceRange(lo, hi, minSpan) {
+  if (hi - lo < minSpan) { const m = (hi + lo) / 2; lo = m - minSpan / 2; hi = m + minSpan / 2; }
+  const step = Math.pow(10, Math.floor(Math.log10((hi - lo) / 4)));
+  const s = [1, 2, 5, 10].map(k => k * step).find(k => (hi - lo) / k <= 5);
+  return {lo: Math.floor(lo / s) * s, hi: Math.ceil(hi / s) * s, step: s};
+}
+
+function draw(c) {
+  const cv = c.cv, dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const L = 40, R = 8, T = 8, B = 18, pw = w - L - R, ph = h - T - B;
+  const now = Date.now() / 1000, t0 = now - WINDOW_S;
+  let lo = c.zero ? 0 : Infinity, hi = c.zero ? 0 : -Infinity;
+  c.data.forEach(p => c.series.forEach(s => { lo = Math.min(lo, p[s.i]); hi = Math.max(hi, p[s.i]); }));
+  if (!isFinite(lo)) { lo = 0; hi = 100; }
+  const r = niceRange(lo, hi, c.zero ? 4 : 50);
+  const x = t => L + (t - t0) / WINDOW_S * pw;
+  const y = v => T + (1 - (v - r.lo) / (r.hi - r.lo)) * ph;
+  g.font = "11px " + css("--mono");
+  g.fillStyle = css("--muted"); g.strokeStyle = css("--line"); g.lineWidth = 1;
+  g.textAlign = "right"; g.textBaseline = "middle";
+  for (let v = r.lo; v <= r.hi + 1e-9; v += r.step) {
+    const yy = Math.round(y(v)) + .5;
+    g.beginPath(); g.moveTo(L, yy); g.lineTo(L + pw, yy); g.stroke();
+    g.fillText(+v.toFixed(2), L - 6, yy);
+  }
+  if (c.zero && r.lo < 0 && r.hi > 0) {
+    g.strokeStyle = css("--text-2"); g.beginPath();
+    g.moveTo(L, Math.round(y(0)) + .5); g.lineTo(L + pw, Math.round(y(0)) + .5); g.stroke();
+  }
+  g.textAlign = "center"; g.textBaseline = "top";
+  [30, 20, 10, 0].forEach(s => g.fillText(s ? "-" + s + "s" : "now", x(now - s), T + ph + 4));
+  c.series.forEach(s => {
+    g.strokeStyle = css(s.color); g.lineWidth = 2; g.lineJoin = "round";
+    g.beginPath();
+    c.data.forEach((p, k) => { const px = x(p[0]), py = y(p[s.i]); k ? g.lineTo(px, py) : g.moveTo(px, py); });
+    g.stroke();
+  });
+  // Hover crosshair
+  if (c.hover !== null && c.data.length) {
+    const tt = t0 + (c.hover - L) / pw * WINDOW_S;
+    let best = c.data[0];
+    c.data.forEach(p => { if (Math.abs(p[0] - tt) < Math.abs(best[0] - tt)) best = p; });
+    const px = x(best[0]);
+    g.strokeStyle = css("--text-2"); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(px + .5, T); g.lineTo(px + .5, T + ph); g.stroke();
+    c.series.forEach(s => {
+      g.fillStyle = css(s.color); g.strokeStyle = css("--panel"); g.lineWidth = 2;
+      g.beginPath(); g.arc(px, y(best[s.i]), 4, 0, 7); g.fill(); g.stroke();
+    });
+    c.tip.style.display = "block";
+    c.tip.innerHTML = clock(best[0]) + "<br>" + c.series.map(s =>
+      '<span style="color:' + css(s.color) + '">●</span> ' + s.name + " " +
+      (+best[s.i]).toFixed(c.zero ? 1 : 0) + " " + c.unit).join("<br>");
+    const tw = c.tip.offsetWidth;
+    c.tip.style.left = Math.min(Math.max(px + 10, 0), w - tw) + "px";
+    c.tip.style.top = (cv.offsetTop + 6) + "px";
+  } else c.tip.style.display = "none";
+}
+function drawAll() { draw(charts.spd); draw(charts.err); }
+Object.values(charts).forEach(c => {
+  c.cv.addEventListener("mousemove", e => { c.hover = e.offsetX; draw(c); });
+  c.cv.addEventListener("mouseleave", () => { c.hover = null; draw(c); });
+});
+window.addEventListener("resize", drawAll);
+
+/* ---------- Staleness ticker ---------- */
+setInterval(() => {
+  const now = Date.now() / 1000;
+  if (lastTlm) {
+    const age = now - lastTlm;
+    $("tlmAge").textContent = age < 2 ? "live" : "stale " + age.toFixed(0) + " s";
+  }
+  if (BS.ts) {
+    const age = now - BS.ts;
+    $("bsAge").textContent = age < 2 ? "live" : "read " + age.toFixed(0) + " s ago";
+  }
+  if (lastHb) {
+    const age = now - lastHb;
+    setDot("dotHb", age < 3 ? "ok" : age < 10 ? "warn" : "bad");
+  }
+  trim(spdSeries); trim(errSeries); drawAll();
+}, 1000);
+
+drawAll();
+renderBs();
+connect();
+</script>
+</body>
+</html>
